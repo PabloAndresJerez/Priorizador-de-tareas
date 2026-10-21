@@ -1,0 +1,6 @@
+{
+  "name": "Orden de Prioridades — Google Tasks",
+  "description": "Organiza y prioriza de forma interactiva y visual tus listas de Google Tasks según tus dimensiones de vida (Salud, Familia, Trabajo, Ocio) y sincroniza el orden con Google Tasks.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
