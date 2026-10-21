@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { X } from 'lucide-react';
 import {
   type EnrichedTask,
@@ -6,7 +6,11 @@ import {
   type ImpactLevel,
   type PriorityPillar,
   type UrgencyLevel,
+  QUADRANT_META,
+  scoreTask,
 } from '../utils/priorityEngine';
+import { dueToYmd, ymdToGoogleDue } from '../utils/dates';
+import { ScoreBreakdownBar, ScoreRing } from './ScoreVisuals';
 
 interface TaskEditorModalProps {
   isOpen: boolean;
@@ -60,7 +64,7 @@ export const TaskEditorModal: React.FC<TaskEditorModalProps> = ({
       setUrgency(initialTask.urgency);
       setImpact(initialTask.impact);
       setEstimatedMinutes(initialTask.estimatedMinutes);
-      setDueDate(initialTask.due ? initialTask.due.slice(0, 10) : '');
+      setDueDate(dueToYmd(initialTask.due) || '');
       setCreatedDate(
         initialTask.createdAt
           ? initialTask.createdAt.slice(0, 10)
@@ -79,6 +83,23 @@ export const TaskEditorModal: React.FC<TaskEditorModalProps> = ({
     }
     setValidationError(null);
   }, [initialTask, isOpen, defaultListId, defaultPillarId, lists, pillars]);
+
+  const preview = useMemo(
+    () =>
+      scoreTask(
+        {
+          pillarId,
+          urgency,
+          impact,
+          estimatedMinutes: Math.max(5, Number(estimatedMinutes) || 30),
+          due: dueDate ? ymdToGoogleDue(dueDate) : undefined,
+          createdAt: createdDate ? new Date(`${createdDate}T09:00:00`).toISOString() : undefined,
+          status: 'needsAction',
+        },
+        pillars
+      ),
+    [pillarId, urgency, impact, estimatedMinutes, dueDate, createdDate, pillars]
+  );
 
   if (!isOpen) return null;
 
@@ -107,7 +128,7 @@ export const TaskEditorModal: React.FC<TaskEditorModalProps> = ({
       urgency,
       impact,
       estimatedMinutes: Math.max(5, Number(estimatedMinutes) || 30),
-      due: dueDate ? new Date(`${dueDate}T12:00:00`).toISOString() : undefined,
+      due: dueDate ? ymdToGoogleDue(dueDate) : undefined,
       createdAt: resolvedCreatedAt,
     });
   };
@@ -119,7 +140,7 @@ export const TaskEditorModal: React.FC<TaskEditorModalProps> = ({
       aria-modal="true"
       aria-labelledby="task-editor-title"
     >
-      <div className="w-full max-w-lg rounded-xl border border-slate-200 bg-white p-6 shadow-lg">
+      <div className="max-h-[92vh] w-full max-w-lg overflow-y-auto rounded-xl border border-slate-200 bg-white p-6 shadow-lg">
         <div className="flex items-center justify-between border-b border-slate-200 pb-4">
           <h2 id="task-editor-title" className="text-base font-semibold text-slate-900">
             {initialTask ? 'Editar tarea y prioridad' : 'Nueva tarea priorizada'}
@@ -283,6 +304,21 @@ export const TaskEditorModal: React.FC<TaskEditorModalProps> = ({
               placeholder="Detalles que se guardarán en Google Tasks..."
               className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-xs text-slate-900 focus:border-slate-900 focus:outline-none"
             />
+          </div>
+
+          <div className="flex items-center gap-3 rounded-lg bg-slate-50 p-3">
+            <ScoreRing score={preview.score} size={44} />
+            <div className="min-w-0 flex-1">
+              <div className="flex items-center justify-between text-xs">
+                <span className="font-semibold text-slate-900">Puntaje estimado</span>
+                <span className="font-medium" style={{ color: QUADRANT_META[preview.quadrant].tone }}>
+                  {QUADRANT_META[preview.quadrant].title}
+                </span>
+              </div>
+              <div className="mt-1.5">
+                <ScoreBreakdownBar breakdown={preview.breakdown} showLegend />
+              </div>
+            </div>
           </div>
 
           <div className="flex items-center justify-end gap-3 border-t border-slate-200 pt-4">

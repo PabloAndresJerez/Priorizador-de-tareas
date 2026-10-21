@@ -6,6 +6,7 @@ import {
   serializeTaskForGoogle,
   recalculateAllTasks,
 } from '../utils/priorityEngine';
+import { addDays, dueToYmd, localDateToYmd, ymdToGoogleDue } from '../utils/dates';
 
 const TASKS_API_BASE = 'https://tasks.googleapis.com/tasks/v1';
 
@@ -16,18 +17,39 @@ interface RawGoogleTask {
   status?: 'needsAction' | 'completed';
   due?: string;
   position?: string;
+  parent?: string;
   updated?: string;
+}
+
+/** Follows nextPageToken so lists with more than 100 tasks (or 50 lists) are read completely. */
+async function fetchAllPages<T>(accessToken: string, baseUrl: string): Promise<{ ok: true; items: T[] } | { ok: false; res: Response }> {
+  const items: T[] = [];
+  let pageToken: string | undefined;
+  do {
+    const sep = baseUrl.includes('?') ? '&' : '?';
+    const url = pageToken ? `${baseUrl}${sep}pageToken=${encodeURIComponent(pageToken)}` : baseUrl;
+    const res = await fetch(url, { headers: { Authorization: `Bearer ${accessToken}` } });
+    if (!res.ok) return { ok: false, res };
+    const data = await res.json();
+    items.push(...((data.items || []) as T[]));
+    pageToken = data.nextPageToken;
+  } while (pageToken);
+  return { ok: true, items };
+}
+
+function toGoogleDue(due?: string): string | undefined {
+  const ymd = dueToYmd(due);
+  return ymd ? ymdToGoogleDue(ymd) : undefined;
 }
 
 export async function fetchAllGoogleTasks(
   accessToken: string,
   pillars: PriorityPillar[]
 ): Promise<{ lists: GoogleTaskList[]; tasks: EnrichedTask[] }> {
-  const listsRes = await fetch(`${TASKS_API_BASE}/users/@me/lists?maxResults=50`, {
-    headers: { Authorization: `Bearer ${accessToken}` },
-  });
+  const listsPage = await fetchAllPages<any>(accessToken, `${TASKS_API_BASE}/users/@me/lists?maxResults=100`);
 
-  if (!listsRes.ok) {
+  if (!listsPage.ok) {
+    const listsRes = listsPage.res;
     const errText = await listsRes.text();
     if (
       listsRes.status === 403 ||
@@ -43,8 +65,7 @@ export async function fetchAllGoogleTasks(
     throw new Error(`No se pudieron leer las listas de Google Tasks (código ${listsRes.status}).`);
   }
 
-  const listsData = await listsRes.json();
-  const lists: GoogleTaskList[] = (listsData.items || []).map((item: any) => ({
+  const lists: GoogleTaskList[] = listsPage.items.map((item: any) => ({
     id: item.id,
     title: item.title || 'Lista sin nombre',
     updated: item.updated,
@@ -54,16 +75,13 @@ export async function fetchAllGoogleTasks(
 
   await Promise.all(
     lists.map(async (list) => {
-      const tasksRes = await fetch(
-        `${TASKS_API_BASE}/lists/${encodeURIComponent(list.id)}/tasks?showCompleted=true&showHidden=true&maxResults=100`,
-        {
-          headers: { Authorization: `Bearer ${accessToken}` },
-        }
+      const tasksPage = await fetchAllPages<RawGoogleTask>(
+        accessToken,
+        `${TASKS_API_BASE}/lists/${encodeURIComponent(list.id)}/tasks?showCompleted=true&showHidden=true&maxResults=100`
       );
 
-      if (!tasksRes.ok) return;
-      const tasksData = await tasksRes.json();
-      const rawItems: RawGoogleTask[] = tasksData.items || [];
+      if (!tasksPage.ok) return;
+      const rawItems = tasksPage.items;
 
       rawItems.forEach((item, idx) => {
         if (!item.title || !item.title.trim()) return;
@@ -76,7 +94,8 @@ export async function fetchAllGoogleTasks(
           item.notes,
           pillars,
           item.due,
-          fallbackCreatedIso
+          fallbackCreatedIso,
+          list.title
         );
         const status = item.status === 'completed' ? 'completed' : 'needsAction';
 
@@ -92,6 +111,7 @@ export async function fetchAllGoogleTasks(
           due: item.due,
           createdAt: parsed.createdAt,
           position: item.position,
+          parent: item.parent,
           pillarId: parsed.pillarId,
           urgency: parsed.urgency,
           impact: parsed.impact,
@@ -125,8 +145,9 @@ export async function createTaskInGoogle(
     title: serialized.title,
     notes: serialized.notes,
   };
-  if (task.due) {
-    body.due = new Date(task.due).toISOString();
+  const due = toGoogleDue(task.due);
+  if (due) {
+    body.due = due;
   }
 
   const res = await fetch(`${TASKS_API_BASE}/lists/${encodeURIComponent(listId)}/tasks`, {
@@ -162,8 +183,9 @@ export async function updateTaskInGoogle(
     notes: serialized.notes,
     status: task.status,
   };
-  if (task.due) {
-    body.due = new Date(task.due).toISOString();
+  const due = toGoogleDue(task.due);
+  if (due) {
+    body.due = due;
   }
 
   const res = await fetch(
@@ -211,14 +233,18 @@ export async function syncPrioritizedListOrderInGoogle(
   pillars: PriorityPillar[],
   includeTitlePrefix = true
 ): Promise<void> {
-  // First PATCH metadata/titles so priority tags and creation date are reflected in Google Tasks
+  // PATCH only the tasks whose title/notes actually change, instead of rewriting every task on each sync
   for (const task of orderedTasksForList) {
+    const serialized = serializeTaskForGoogle(task, pillars, includeTitlePrefix);
+    if (serialized.title === task.title && serialized.notes === task.notes && !task.isDirty) continue;
     await updateTaskInGoogle(accessToken, listId, task.id, task, pillars, includeTitlePrefix);
   }
 
-  // Then call Google Tasks move endpoint sequentially from first to last so the exact order is reflected in Google Tasks
+  // Reorder only top-level tasks: moving a subtask without its parent would flatten it out of
+  // its parent task. Subtasks travel along with their parent.
+  const topLevel = orderedTasksForList.filter((t) => !t.parent);
   let previousTaskId: string | null = null;
-  for (const task of orderedTasksForList) {
+  for (const task of topLevel) {
     const query = previousTaskId ? `?previous=${encodeURIComponent(previousTaskId)}` : '';
     const moveRes = await fetch(
       `${TASKS_API_BASE}/lists/${encodeURIComponent(listId)}/tasks/${encodeURIComponent(task.id)}/move${query}`,
@@ -375,6 +401,45 @@ export function createInitialDemoTasks(pillars: PriorityPillar[]): EnrichedTask[
       createdDaysAgo: 5,
     },
     {
+      id: 'demo-11',
+      listId: 'list-personal',
+      listTitle: 'Mis Tareas Personales',
+      cleanTitle: 'Pagar el seguro del auto',
+      cleanNotes: 'Se pasó la fecha: revisar si cobran recargo.',
+      pillarId: 'finanzas',
+      urgency: 'high',
+      impact: 'high',
+      estimatedMinutes: 10,
+      dueOffsetDays: -2,
+      createdDaysAgo: 9,
+    },
+    {
+      id: 'demo-12',
+      listId: 'list-hogar',
+      listTitle: 'Hogar y Familia',
+      cleanTitle: 'Llamar a mamá',
+      cleanNotes: '',
+      pillarId: 'familia',
+      urgency: 'medium',
+      impact: 'high',
+      estimatedMinutes: 15,
+      dueOffsetDays: 0,
+      createdDaysAgo: 0,
+    },
+    {
+      id: 'demo-13',
+      listId: 'list-personal',
+      listTitle: 'Mis Tareas Personales',
+      cleanTitle: 'Ordenar el placard y donar ropa',
+      cleanNotes: 'Separar en tres bolsas.',
+      pillarId: 'ocio',
+      urgency: 'low',
+      impact: 'low',
+      estimatedMinutes: 150,
+      dueOffsetDays: 20,
+      createdDaysAgo: 26,
+    },
+    {
       id: 'demo-10',
       listId: 'list-personal',
       listTitle: 'Mis Tareas Personales',
@@ -392,9 +457,8 @@ export function createInitialDemoTasks(pillars: PriorityPillar[]): EnrichedTask[
 
   const now = Date.now();
   const enriched: EnrichedTask[] = rawDemo.map((item) => {
-    const dueDate = new Date(now + item.dueOffsetDays * 24 * 60 * 60 * 1000);
+    const dueIso = ymdToGoogleDue(localDateToYmd(addDays(new Date(now), item.dueOffsetDays)));
     const createdDate = new Date(now - item.createdDaysAgo * 24 * 60 * 60 * 1000);
-    const dueIso = dueDate.toISOString();
     const createdIso = createdDate.toISOString();
     const status = item.status || 'needsAction';
     const serialized = serializeTaskForGoogle(
